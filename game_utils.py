@@ -10,7 +10,7 @@ import sys
 
 from collections      import deque
 from keras.models     import Sequential
-from keras.layers     import Dense
+from keras.layers     import Dense, Conv2D, BatchNormalization
 from keras.optimizers import Adam, SGD
 from IPython.display import clear_output
 from datetime import timedelta
@@ -22,9 +22,42 @@ from keras.layers.advanced_activations import LeakyReLU
 
 CIRCLE = 0.5
 CROSS = 1.0
+DEBUG = False
 
+def rewardFromCloseness(board, action, piece):
+    row = int(action/board.shape[1]) + 1
+    col = action % board.shape[0] + 1
+    if(DEBUG == True):
+        print("Action: ", action, "Row/Col ", row, col)
+        print(board.shape)
+    board = np.pad(board, (1,1), mode='constant')
+    distance = 1
+    neighbours = board[row-distance:row+distance+1, col-distance:col+distance+1].flatten()
+    neighbours[4] = 0.0
+    if(DEBUG == True):
+        nprint = np.reshape(neighbours, (3,3))
+        print(nprint)
+    reward = 0.0
+    if(np.count_nonzero(neighbours == piece) > 0):
+        reward += 2.0
+    if(np.count_nonzero(neighbours == nextPiece(piece)) > 0):
+        reward += 1.0
+    if(DEBUG == True):
+        print(reward)
+    return reward
+    
+def switchPiecesOfState(state):
+    switchedState = []
+    for x in state[0]:
+        value = 0.0
+        if(x == CIRCLE):
+            value = CROSS
+        elif(x == CROSS):
+            value = CIRCLE
+        switchedState.append(value)
 
-
+    return np.reshape(np.array(switchedState), [1, len(switchedState)])  
+                                       
 def nextPiece(currentPiece):
     if (currentPiece == CIRCLE):
         return CROSS
@@ -87,7 +120,7 @@ def softmax(x):
     return e_x / e_x.sum(axis=1) 
 
 class Agent():
-    def __init__(self, stateSize, actionSize, loadModel):
+    def __init__(self, stateSize, actionSize, loadModel, parameterList):
         self.weights            = "fir_weight.h5"
         self.stateSize          = stateSize
         self.actionSize        = actionSize
@@ -98,22 +131,23 @@ class Agent():
         self.explorationMin    = 0.01
         self.explorationDecay  = 0.995
         self.loadModel          = loadModel
-        self.brain              = self._buildModel()
+        self.brain              = self._buildModel(parameterList)
         self.loss               = deque(maxlen=100)
     
-    def _buildModel(self):
+    def _buildModel(self, parameterList):
         model = Sequential()
-        model.add(Dense(512, input_dim=self.stateSize, kernel_initializer='lecun_uniform'))
+        model.add(Dense(1024, input_dim=self.stateSize))
+        model.add(BatchNormalization())
         model.add(LeakyReLU(alpha=0.1))
-        model.add(Dropout(0.2))
-        model.add(Dense(386, kernel_initializer='lecun_uniform'))
+        model.add(Dropout(0.3))
+        model.add(Dense(1024))     
+        model.add(BatchNormalization())
         model.add(LeakyReLU(alpha=0.1))
-        model.add(Dropout(0.2))
-        model.add(Dense(135, kernel_initializer='lecun_uniform'))
-        model.add(LeakyReLU(alpha=0.1))
+        model.add(Dropout(0.3))
 
         opt = SGD(lr=self.learningRate , momentum=0.9, decay=1e-18, nesterov=False)
-
+        adam = Adam(lr = 0.001)
+       
         model.add(Dense(self.actionSize, activation='linear'))
         model.compile(loss='mse', optimizer=opt)
         
@@ -121,7 +155,9 @@ class Agent():
             if os.path.isfile(self.weights):
                 model.load_weights(self.weights)
                 self.explorationRate = self.explorationMin
-        
+        if(parameterList is not None):
+            model = parameterList['model']
+            model.compile(loss='mse', optimizer = parameterList['opt'])
         return model
 
     def saveModel(self):
@@ -139,11 +175,8 @@ class Agent():
         return np.argmax(actionValues[0])
     
     def actWithoutExploration(self, state):
-        np.set_printoptions(precision=3)
-
         actionValues = self.brain.predict(state)
         actionValues = self.maskInvalidActions(actionValues, state)
-
         return np.argmax(actionValues[0])
     
     def remember(self, state, action, reward, nextState, done):
@@ -165,11 +198,13 @@ class Agent():
                 update = reward + self.gamma * newMaxQ
             y = self.brain.predict(state)
             y[0][action] = update
+            if(np.isnan(y[0]).any()):
+                sys.exit()
             X_train.append(state.reshape((self.stateSize,)))
             y_train.append(y.reshape((self.actionSize,)))
         X_train = np.array(X_train)
         y_train = np.array(y_train)
-        self.brain.fit(X_train, y_train, epochs = 1, verbose = 0, batchSize = sampleBatchSize)
+        self.brain.fit(X_train, y_train, epochs = 1, verbose = 0, batch_size = sampleBatchSize)
         if self.explorationRate > self.explorationMin:
             self.explorationRate *= self.explorationDecay
     
@@ -202,6 +237,8 @@ class Environment():
         else:
             state[0][action] = CIRCLE
         
+        closenessReward = rewardFromCloseness(self.board, action, self.nextPiece)
+        
         self.nextPiece = nextPiece(self.nextPiece)
         self.board = np.reshape(state, (self.boardSize, self.boardSize))
         nextState = self.board
@@ -215,8 +252,9 @@ class Environment():
             reward += -5.0
             done = True
         else:
-            reward -= 1.0
+            reward -= 0.01
         
+        reward += closenessReward
         return nextState, reward, done
     
     def reset(self):
@@ -230,15 +268,16 @@ class Environment():
         return state, done
             
 class FIR():
-    def __init__(self, learningPiece, loadModel):
+    def __init__(self, learningPiece, loadModel, parameterList, epochs = 2500):
         self.sampleBatchSize = 32
-        self.epochs = 50000
+        self.epochs = epochs
         self.environment = Environment(15)
         self.stateSize = self.environment.stateSize
         self.actionSize = self.environment.actionSize
-        self.agent = Agent(self.stateSize, self.actionSize, loadModel)
+        self.agent = Agent(self.stateSize, self.actionSize, loadModel, parameterList)
         self.learningPiece = learningPiece
     def test(self):
+        DEBUG = True
         done = False
         count = 0
         self.environment = Environment(15)
@@ -256,8 +295,10 @@ class FIR():
             count += 1
             if(count > self.actionSize):
                 break
+        print("Total steps: ", count)
             
     def run(self):
+        DEBUG = False
         try:
             start_time = time.time()
             for epoch in range(self.epochs):
@@ -270,19 +311,39 @@ class FIR():
                     stepIndex += 1
                     if(stepIndex > self.actionSize + 1):
                         print("Something is wrong..")
+                        done = True
                         break
                     if(self.environment.nextPiece != self.learningPiece):
-                        opponentAction = self.agent.actWithoutExploration(state)
+                        opponentAction = 0
+                        if(self.environment.nextPiece == CIRCLE):
+                            switchedState = switchPiecesOfState(state)
+                            opponentAction = self.agent.actWithoutExploration(switchedState)
+                        else:
+                            opponentAction = self.agent.actWithoutExploration(state)
+
                         state, done = self.environment.opponentMove(opponentAction)
                         if(done == True):
                             break
                     else:
-                        action = self.agent.act(state)
+                        switchBackNeeded = False
+                        action = 0
+                        if(self.environment.nextPiece == CIRCLE):
+                            switchedState = switchPiecesOfState(state)
+                            action = self.agent.act(switchedState)
+                            switchBackNeeded = True
+                        else:
+                            action = self.agent.act(state)
+
+
                         nextState, reward, done = self.environment.makeMove(action)
                         nextState = np.reshape(nextState, [1, self.stateSize])
-                        self.agent.remember(state, action, reward, nextState, done)
+                        if(switchBackNeeded == True):
+                            self.agent.remember(switchPiecesOfState(state), action, reward, switchPiecesOfState(nextState), done)
+                        else:
+                            self.agent.remember(state, action, reward, nextState, done)
+                            
                         state = nextState
-
+                        
                 current_time = time.time()
                 time_dif = current_time - start_time
                 if((epoch + 1) % 100 == 0):
